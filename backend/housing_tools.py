@@ -1,57 +1,142 @@
-from typing import List, Optional, Dict, Any
+# backend/housing_tools.py
+import os
+import logging
+from typing import List, Dict, Any
 
-from db import get_pool
+import httpx
+
+logger = logging.getLogger(__name__)
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 
-async def search_off_grounds_listings(
-    max_rent_per_person: Optional[int] = None,
-    min_bedrooms: Optional[int] = None,
-    limit: int = 20,
-) -> List[Dict[str, Any]]:
+# -------------------------
+# 1) Embedding helper
+# -------------------------
+async def embed_query_text(text: str) -> List[float]:
     """
-    Query off_grounds_listings in Supabase with simple filters.
-
-    - max_rent_per_person: only return listings with price_per_person <= this
-    - min_bedrooms: only return listings with bedrooms >= this
+    Returns an embedding vector for the user query.
+    Uses OpenRouter's OpenAI-compatible endpoint.
     """
-    pool = await get_pool()
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing. Check backend/.env loading.")
 
-    where_clauses = []
-    params: list[Any] = []
+    embedding_model = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
 
-    if max_rent_per_person is not None:
-        where_clauses.append("price_per_person <= $" + str(len(params) + 1))
-        params.append(max_rent_per_person)
+    url = "https://openrouter.ai/api/v1/embeddings"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"model": embedding_model, "input": text}
 
-    if min_bedrooms is not None:
-        where_clauses.append("bedrooms >= $" + str(len(params) + 1))
-        params.append(min_bedrooms)
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
-    where_sql = ""
-    if where_clauses:
-        where_sql = "WHERE " + " AND ".join(where_clauses)
+    return data["data"][0]["embedding"]
 
-    query = f"""
+
+# -------------------------
+# 2) Vector search (pgvector) — SAFE VERSION
+# -------------------------
+async def vector_search_housing_chunks(conn, query_embedding: List[float], top_k: int = 6) -> List[Dict[str, Any]]:
+    """
+    Vector search using pgvector (<->).
+    asyncpg needs the embedding passed as a STRING for $1::vector, not a Python list.
+    """
+
+    text_col = os.getenv("HOUSING_CHUNKS_TEXT_COL", "content")
+
+    # Convert Python list -> pgvector literal string: '[0.1,0.2,0.3]'
+    vector_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+
+    sql = f"""
         SELECT
             id,
-            name,
-            address,
-            bedrooms,
-            price_total,
-            price_per_person,
-            url,
-            landlord_contact_url
-        FROM off_grounds_listings
-        {where_sql}
-        ORDER BY price_per_person ASC NULLS LAST
-        LIMIT ${len(params) + 1};
+            {text_col} AS content,
+            embedding <-> $1::vector AS distance
+        FROM housing_chunks
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding <-> $1::vector
+        LIMIT $2;
     """
 
-    params.append(limit)
+    rows = await conn.fetch(sql, vector_str, top_k)
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(query, *params)
+    results = []
+    for r in rows:
+        results.append({
+            "id": r["id"],
+            "content": r["content"],
+            "source": f"housing_chunks:{r['id']}",
+            "url": "",
+            "distance": float(r["distance"]),
+        })
 
-    return [dict(row) for row in rows]
+    return results
 
 
+# -------------------------
+# 3) Off-grounds listings search (safe)
+# -------------------------
+async def search_off_grounds_listings(conn, query: str, limit: int = 5, **kwargs) -> List[Dict[str, Any]]:
+    """
+    Safe stub: accepts extra filters so /chat won't crash.
+    If OFF_GROUNDS_TABLE is not set, returns [].
+
+    kwargs may contain: max_bedrooms, min_price, max_price, etc.
+    We ignore kwargs for now.
+    """
+    table = os.getenv("OFF_GROUNDS_TABLE", "")
+    if not table:
+        return []
+
+    sql = f"""
+        SELECT id, title, price, location, url
+        FROM {table}
+        WHERE title ILIKE $1 OR location ILIKE $1
+        LIMIT $2;
+    """
+
+    rows = await conn.fetch(sql, f"%{query}%", limit)
+
+    return [{
+        "id": r["id"],
+        "title": r["title"],
+        "price": r.get("price"),
+        "location": r.get("location"),
+        "url": r.get("url"),
+    } for r in rows]
+
+
+# -------------------------
+# 4) OpenRouter chat helper
+# -------------------------
+async def call_openrouter_chat(messages: List[Dict[str, str]]) -> str:
+    """
+    Calls OpenRouter chat completions endpoint.
+    """
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing. Check backend/.env loading.")
+
+    chat_model = os.getenv("CHAT_MODEL", "openai/gpt-4o-mini")
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": chat_model,
+        "messages": messages,
+        "temperature": 0.2,
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    return data["choices"][0]["message"]["content"]
