@@ -44,8 +44,7 @@ async def fetch_properties_page(
         timeout=aiohttp.ClientTimeout(total=60),
     ) as resp:
         resp.raise_for_status()
-        data = await resp.json()
-        return data.get("results", [])
+        return await resp.json()
 
 
 async def fetch_rent_estimate(
@@ -61,8 +60,18 @@ async def fetch_rent_estimate(
         headers={"X-Api-Key": RENTCAST_API_KEY},
         timeout=aiohttp.ClientTimeout(total=60),
     ) as resp:
+        if resp.status == 404:
+            # RentCast has no estimate for this address
+            return None
         resp.raise_for_status()
-        return await resp.json("rent")
+        data = await resp.json()
+
+        if "rent" in data:
+            return data["rent"]
+        elif "rentLow" in data and "rentHigh" in data:
+            return (data["rentLow"] + data["rentHigh"]) // 2
+
+        return None
     
 
 async def map_property_to_listing(session: aiohttp.ClientSession, p: dict) -> OffGroundListingModel:
