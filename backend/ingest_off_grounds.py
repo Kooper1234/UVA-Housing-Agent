@@ -2,98 +2,122 @@ import os
 import asyncio
 import aiohttp
 from typing import Optional, List
-from dotenv import load_dotenv
 from pathlib import Path
+from math import radians, cos, sin, acos
 from dotenv import load_dotenv
 
 from db import get_pool
 from models import OffGroundListingModel
 
+# Load env
 load_dotenv(Path(__file__).parent / ".env")
 
-
 RENTCAST_API_KEY = os.getenv("RENTCAST_API_KEY")
-
 if not RENTCAST_API_KEY:
     raise RuntimeError("RENTCAST_API_KEY not set")
 
 BASE_URL = "https://api.rentcast.io/v1"
-PROPERTIES_URL = f"{BASE_URL}/properties"
-RENT_ESTIMATES_URL = f"{BASE_URL}/rent-estimates"
-PAGE_LIMIT = 500
+LISTINGS_URL = f"{BASE_URL}/listings"
+
+PAGE_LIMIT = 10
+MAX_LISTINGS = 100
+
+# UVA location
+UVA_LAT = 38.034
+UVA_LON = -78.503
+MAX_DISTANCE_MILES = 3
+MAX_BEDROOMS = 4
 
 
-async def fetch_properties_page(
-    session: aiohttp.ClientSession,
-    *, 
-    city: Optional[str] = None, 
-    county: Optional[str] = None, 
-    state: str, 
-    offset: int
-) -> List[dict]:
-    params = {"state": state, "limit": PAGE_LIMIT, "offset": offset}
-    if city:
-        params["city"] = city
-    if county:
-        params["county"] = county
-
-    async with session.get(
-        PROPERTIES_URL,
-        params=params,
-        headers={"X-Api-Key": RENTCAST_API_KEY},
-        timeout=aiohttp.ClientTimeout(total=60),
-    ) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+def distance_miles(lat1, lon1, lat2, lon2):
+    return 3959 * acos(
+        cos(radians(lat1)) * cos(radians(lat2)) *
+        cos(radians(lon2) - radians(lon1)) +
+        sin(radians(lat1)) * sin(radians(lat2))
+    )
 
 
-async def fetch_rent_estimate(
+async def fetch_listings_page(
     session: aiohttp.ClientSession,
     *,
-    address: str
-) -> Optional[int]:
-    params = {"address": address}
+    city: str,
+    state: str,
+    page: int
+) -> dict:
+    LISTINGS_URL = f"{BASE_URL}/listings/search"  # fixed endpoint
 
-    async with session.get(
-        RENT_ESTIMATES_URL, 
-        params=params, 
-        headers={"X-Api-Key": RENTCAST_API_KEY},
-        timeout=aiohttp.ClientTimeout(total=60),
-    ) as resp:
-        if resp.status == 404:
-            # RentCast has no estimate for this address
-            return None
-        resp.raise_for_status()
-        data = await resp.json()
+    params = {
+        "city": city,
+        "state": state,
+        "status": "Active",
+        "limit": PAGE_LIMIT,
+        "page": page,
+        "propertyType": "Apartment"
+    }
 
-        if "rent" in data:
-            return data["rent"]
-        elif "rentLow" in data and "rentHigh" in data:
-            return (data["rentLow"] + data["rentHigh"]) // 2
+    try:
+        async with session.get(
+            LISTINGS_URL,
+            params=params,
+            headers={"Authorization": f"Bearer {RENTCAST_API_KEY}"},
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            if resp.status == 404:
+                print(f"❌ 404 Not Found: {LISTINGS_URL}")
+                return {}
+            elif resp.status != 200:
+                text = await resp.text()
+                print(f"❌ Error fetching listings: {resp.status} {text}")
+                return {}
+            return await resp.json()
 
+    except aiohttp.ClientError as e:
+        print(f"❌ Client error fetching listings: {e}")
+        return {}
+    except asyncio.TimeoutError:
+        print(f"❌ Timeout fetching listings page {page}")
+        return {}
+
+
+
+
+def map_listing_to_model(l: dict) -> Optional[OffGroundListingModel]:
+    address = l.get("formattedAddress")
+    rent = l.get("rent")
+    bedrooms = l.get("bedrooms")
+    latitude = l.get("latitude")
+    longitude = l.get("longitude")
+
+    if not address or bedrooms is None:
         return None
-    
 
-async def map_property_to_listing(session: aiohttp.ClientSession, p: dict) -> OffGroundListingModel:
-    address = p.get("formattedAddress")
-    bedrooms = p.get("bedrooms")
-    rent = await fetch_rent_estimate(session, address=address) if address else None
+    if bedrooms > MAX_BEDROOMS:
+        return None
 
-    if address:
-        rent = await fetch_rent_estimate(session, address=address)
+    if latitude is None or longitude is None:
+        return None
+
+    if distance_miles(UVA_LAT, UVA_LON, latitude, longitude) > MAX_DISTANCE_MILES:
+        return None
+
+    price_per_person = None
+    if rent is not None and bedrooms > 0:
+        price_per_person = rent // bedrooms
 
     return OffGroundListingModel(
-        id=p["id"],
+        id=l["id"],
         name=address,
         address=address,
-        latitude=p.get("latitude"),
-        longitude=p.get("longitude"),
+        latitude=latitude,
+        longitude=longitude,
         bedrooms=bedrooms,
-        price_total=rent,
-        price_per_person=(rent // bedrooms if rent and bedrooms else None),
-        url=p.get("url"),
+        price_total=rent,              # can be NULL
+        price_per_person=price_per_person,
+        url=l.get("listingUrl"),
         landlord_contact_url=None,
     )
+
+
 
 async def upsert_off_grounds_listings(listings: List[OffGroundListingModel]):
     if not listings:
@@ -106,11 +130,6 @@ async def upsert_off_grounds_listings(listings: List[OffGroundListingModel]):
     )
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
     ON CONFLICT (id) DO UPDATE SET
-        name = excluded.name,
-        address = excluded.address,
-        latitude = excluded.latitude,
-        longitude = excluded.longitude,
-        bedrooms = excluded.bedrooms,
         price_total = excluded.price_total,
         price_per_person = excluded.price_per_person,
         last_seen_at = now()
@@ -137,34 +156,47 @@ async def upsert_off_grounds_listings(listings: List[OffGroundListingModel]):
         await conn.executemany(query, rows)
 
 
-async def ingest_area(*, city=None, county=None, state="VA"):
-    offset = 0
+async def ingest_city(city: str, state: str = "VA"):
+    page = 1
     total = 0
 
     async with aiohttp.ClientSession() as session:
-        while True:
-            location = city or county or state
-            print(f"Fetching properties offset={offset} ({location})")
-            properties = await fetch_properties_page(
-                session, city=city, county=county, state=state, offset=offset
+        while total < MAX_LISTINGS:
+            print(f"Fetching listings page={page} ({city})")
+
+            raw = await fetch_listings_page(
+                session,
+                city=city,
+                state=state,
+                page=page
             )
-            if not properties:
+
+            listings_raw = raw.get("listings", [])
+            if not listings_raw:
                 break
 
-            listings = [await map_property_to_listing(session, p) for p in properties]
-            await upsert_off_grounds_listings(listings)
+            models = []
+            for l in listings_raw:
+                model = map_listing_to_model(l)
+                if model:
+                    models.append(model)
+                if total + len(models) >= MAX_LISTINGS:
+                    break
 
-            total += len(listings)
-            offset += PAGE_LIMIT
-            print(f"Ingested {total} listings so far for {location}")
+            await upsert_off_grounds_listings(models)
 
-    print(f"Done ingesting {city or county or state}")
+            total += len(models)
+            page += 1
+
+            print(f"Ingested {total} listings")
+
+    print(f"✅ Done ingesting {city}")
+
 
 
 async def main():
-    await ingest_area(city="Charlottesville", state="VA")
-    await ingest_area(county="Albemarle", state="VA")
-    print("Off-grounds ingestion complete")
+    await ingest_city("Charlottesville")
+    print("✅ Student housing ingestion complete")
 
 
 if __name__ == "__main__":
