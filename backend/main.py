@@ -3,15 +3,16 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from db import get_pool
 from housing_tools import search_off_grounds_listings
+from preference_extractor import extract_preferences
 
 app = FastAPI()
 
 
 class ChatRequest(BaseModel):
     """
-    Minimal chat request model.
-    For now, the user can optionally pass numeric filters directly; later
-    you'll parse them out of the free-form message using an LLM.
+    Chat request model.
+    The LLM will extract preferences from the message, but you can also
+    override them by passing explicit filters.
     """
     message: str
     max_rent_per_person: int | None = None
@@ -87,41 +88,62 @@ async def search_off_grounds(
 @app.post("/chat")
 async def chat(request: ChatRequest):
     """
-    Very simple chat endpoint:
-    - Takes a message and optional numeric filters.
-    - Calls search_off_grounds_listings.
-    - Returns a basic text response plus the raw listings.
-
+    Smart chat endpoint that uses LLM to extract preferences from natural language.
+    
+    - Extracts max_rent_per_person, min_bedrooms, max_bedrooms from the message
+    - Explicit filters in the request body override LLM-extracted values
+    - Searches listings and returns results
+    
     Example body:
     {
-      "message": "Looking for a 3BR or 4BR near Grounds around $900/person",
-      "max_rent_per_person": 900,
-      "min_bedrooms": 3,
-      "max_bedrooms": 4
+      "message": "I'm looking for a 4 bedroom place around $900 per person"
     }
     """
-    listings = await search_off_grounds_listings(
-        max_rent_per_person=request.max_rent_per_person,
-        min_bedrooms=request.min_bedrooms,
-        max_bedrooms=request.max_bedrooms,
-        limit=10,
-    )
-
-    count = len(listings)
-    if count == 0:
-        reply = "I couldn't find any off-grounds listings that match those filters yet. Try adjusting the budget or bedroom count."
-    else:
-        reply = (
-            f"I found {count} off-grounds place(s) that match your filters. "
-            "Here are some options with their prices and bedroom counts."
+    try:
+        # Extract preferences using LLM
+        extracted = extract_preferences(request.message)
+        
+        # Use explicit filters if provided, otherwise use LLM-extracted values
+        max_rent = request.max_rent_per_person or extracted.get("max_rent_per_person")
+        min_bedrooms = request.min_bedrooms or extracted.get("min_bedrooms")
+        max_bedrooms = request.max_bedrooms or extracted.get("max_bedrooms")
+        
+        # Search listings
+        listings = await search_off_grounds_listings(
+            max_rent_per_person=max_rent,
+            min_bedrooms=min_bedrooms,
+            max_bedrooms=max_bedrooms,
+            limit=10,
         )
 
-    return {
-        "message": reply,
-        "filters_used": {
-            "max_rent_per_person": request.max_rent_per_person,
-            "min_bedrooms": request.min_bedrooms,
-            "max_bedrooms": request.max_bedrooms,
-        },
-        "results": listings,
-    }
+        count = len(listings)
+        if count == 0:
+            reply = (
+                f"I searched for listings matching your preferences, but couldn't find any results. "
+                "Try adjusting your budget or bedroom requirements."
+            )
+        else:
+            reply = (
+                f"I found {count} off-grounds place(s) that match your preferences. "
+                "Here are some options with their prices and bedroom counts."
+            )
+
+        return {
+            "message": reply,
+            "filters_used": {
+                "max_rent_per_person": max_rent,
+                "min_bedrooms": min_bedrooms,
+                "max_bedrooms": max_bedrooms,
+            },
+            "extracted_from_message": extracted,  # Show what the LLM extracted
+            "results": listings,
+        }
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in /chat endpoint: {error_details}")  # Print to server logs
+        return {
+            "message": f"Sorry, I encountered an error: {str(e)}",
+            "error": str(e),
+            "error_details": error_details,
+        }

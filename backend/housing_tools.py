@@ -6,6 +6,7 @@ from db import get_pool
 async def search_off_grounds_listings(
     max_rent_per_person: Optional[int] = None,
     min_bedrooms: Optional[int] = None,
+    max_bedrooms: Optional[int] = None,
     limit: int = 20,
 ) -> List[Dict[str, Any]]:
     """
@@ -13,6 +14,7 @@ async def search_off_grounds_listings(
 
     - max_rent_per_person: only return listings with price_per_person <= this
     - min_bedrooms: only return listings with bedrooms >= this
+    - max_bedrooms: only return listings with bedrooms <= this
     """
     pool = await get_pool()
 
@@ -26,6 +28,10 @@ async def search_off_grounds_listings(
     if min_bedrooms is not None:
         where_clauses.append("bedrooms >= $" + str(len(params) + 1))
         params.append(min_bedrooms)
+
+    if max_bedrooms is not None:
+        where_clauses.append("bedrooms <= $" + str(len(params) + 1))
+        params.append(max_bedrooms)
 
     where_sql = ""
     if where_clauses:

@@ -28,7 +28,13 @@ def fetch_rentcast_listings(city: str = "Charlottesville", state: str = "VA", li
     
     Returns a list of listing dicts from the API response.
     """
-    url = "https://api.rentcast.io/v1/listings/rentals"
+    # Try different possible endpoints - adjust based on RentCast docs
+    possible_endpoints = [
+        "https://api.rentcast.io/v1/listings/rentals",
+        "https://api.rentcast.io/v1/listings",
+        "https://api.rentcast.io/v1/rentals",
+    ]
+    
     headers = {"X-Api-Key": RENTCAST_API_KEY}
     params = {
         "city": city,
@@ -37,12 +43,25 @@ def fetch_rentcast_listings(city: str = "Charlottesville", state: str = "VA", li
     }
     
     print(f"Fetching listings from RentCast for {city}, {state}...")
-    response = requests.get(url, headers=headers, params=params)
     
-    if response.status_code != 200:
-        print(f"Error from RentCast API: {response.status_code}")
-        print(f"Response: {response.text}")
-        return []
+    for url in possible_endpoints:
+        print(f"Trying endpoint: {url}")
+        response = requests.get(url, headers=headers, params=params)
+        
+        if response.status_code == 200:
+            print(f"✅ Success with endpoint: {url}")
+            data = response.json()
+            listings = data.get("listings", data.get("data", []))
+            print(f"Fetched {len(listings)} listings from RentCast")
+            return listings
+        else:
+            print(f"  ❌ {response.status_code}: {response.text[:200]}")
+    
+    print("\n⚠️  All endpoints failed. Please check:")
+    print("  1. Your RentCast API key is valid")
+    print("  2. The correct endpoint in RentCast documentation")
+    print("  3. Your API plan includes access to listings")
+    return []
     
     data = response.json()
     listings = data.get("listings", [])
