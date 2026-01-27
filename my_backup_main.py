@@ -1,15 +1,8 @@
 # backend/main.py
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional
 from db import get_pool
 from housing_tools import search_off_grounds_listings
-from distance_tools import (
-    enrich_listings_with_distances,
-    get_listings_near_location,
-    get_pois,
-    get_bus_stops
-)
 
 app = FastAPI()
 
@@ -20,6 +13,7 @@ class ChatRequest(BaseModel):
     For now, the user can optionally pass numeric filters directly; later
     you'll parse them out of the free-form message using an LLM.
     """
+
     message: str
     max_rent_per_person: int | None = None
     min_bedrooms: int | None = None
@@ -43,6 +37,8 @@ async def db_check():
             row = await conn.fetchrow("SELECT 1 AS ok;")
         return {"db_connected": True, "result": dict(row)}
     except Exception as e:
+        # In a real prod app you wouldn't return the raw error, but for now it's
+        # helpful for debugging your setup.
         return {"db_connected": False, "error": str(e)}
 
 
@@ -64,25 +60,8 @@ async def test_off_grounds():
             """
         )
 
+    # convert asyncpg Records to plain dicts so FastAPI can JSON-serialize them
     return [dict(row) for row in rows]
-
-
-@app.get("/pois")
-async def list_pois():
-    """
-    List all points of interest.
-    """
-    pois = await get_pois()
-    return {"pois": pois, "count": len(pois)}
-
-
-@app.get("/bus-stops")
-async def list_bus_stops():
-    """
-    List all bus stops.
-    """
-    stops = await get_bus_stops()
-    return {"bus_stops": stops, "count": len(stops)}
 
 
 @app.get("/search/off-grounds")
@@ -91,16 +70,11 @@ async def search_off_grounds(
     min_bedrooms: int | None = None,
     max_bedrooms: int | None = None,
     limit: int = 20,
-    include_distances: bool = Query(False, description="Include walking distances to POIs and bus stops"),
-    include_pois: bool = Query(True, description="Include distances to POIs"),
-    include_bus_stops: bool = Query(True, description="Include distances to bus stops"),
 ):
     """
     Public API endpoint that wraps search_off_grounds_listings.
-    
-    Examples:
-    - Basic search: /search/off-grounds?max_rent_per_person=900&min_bedrooms=4
-    - With distances: /search/off-grounds?max_rent_per_person=900&include_distances=true
+    Example:
+    /search/off-grounds?max_rent_per_person=900&min_bedrooms=4
     """
     listings = await search_off_grounds_listings(
         max_rent_per_person=max_rent_per_person,
@@ -108,58 +82,16 @@ async def search_off_grounds(
         max_bedrooms=max_bedrooms,
         limit=limit,
     )
-    
-    # Optionally enrich with distance data
-    if include_distances:
-        listings = await enrich_listings_with_distances(
-            listings,
-            include_pois=include_pois,
-            include_bus_stops=include_bus_stops
-        )
-    
-    return {"results": listings, "count": len(listings)}
-
-
-@app.get("/search/near-location")
-async def search_near_location(
-    latitude: float = Query(..., description="Target latitude"),
-    longitude: float = Query(..., description="Target longitude"),
-    max_walk_time_minutes: int = Query(20, description="Maximum walking time in minutes"),
-    max_rent_per_person: int | None = None,
-    min_bedrooms: int | None = None,
-    limit: int = 50,
-):
-    """
-    Find listings within walking distance of a specific location.
-    
-    Example:
-    /search/near-location?latitude=38.0336&longitude=-78.5080&max_walk_time_minutes=15&max_rent_per_person=900
-    """
-    listings = await get_listings_near_location(
-        latitude=latitude,
-        longitude=longitude,
-        max_walk_time_minutes=max_walk_time_minutes,
-        max_rent_per_person=max_rent_per_person,
-        min_bedrooms=min_bedrooms,
-        limit=limit
-    )
-    
-    return {
-        "results": listings,
-        "count": len(listings),
-        "search_center": {"latitude": latitude, "longitude": longitude},
-        "max_walk_time_minutes": max_walk_time_minutes
-    }
+    return {"results": listings}
 
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
     """
-    Chat endpoint with distance enrichment.
+    Very simple chat endpoint:
     - Takes a message and optional numeric filters.
     - Calls search_off_grounds_listings.
-    - Enriches results with walking distances.
-    - Returns a basic text response plus the enriched listings.
+    - Returns a basic text response plus the raw listings.
 
     Example body:
     {
@@ -175,9 +107,6 @@ async def chat(request: ChatRequest):
         max_bedrooms=request.max_bedrooms,
         limit=10,
     )
-    
-    # Enrich with distances
-    listings = await enrich_listings_with_distances(listings)
 
     count = len(listings)
     if count == 0:
@@ -185,7 +114,7 @@ async def chat(request: ChatRequest):
     else:
         reply = (
             f"I found {count} off-grounds place(s) that match your filters. "
-            "Here are some options with their prices, bedroom counts, and walking distances to campus locations."
+            "Here are some options with their prices and bedroom counts."
         )
 
     return {
