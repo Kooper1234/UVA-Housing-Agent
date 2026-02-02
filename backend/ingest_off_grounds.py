@@ -4,7 +4,6 @@ import time
 from datetime import datetime
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
-import requests
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -47,30 +46,17 @@ def get_uva_listings():
     try:
         driver.get(SEARCH_URL)
 
-        # Wait for initial listings
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/housing/property/']"))
         )
-        time.sleep(3)
+        time.sleep(5)
 
-        # ----------- SCROLL TO LOAD ALL LISTINGS -----------
-        last_height = driver.execute_script("return document.body.scrollHeight")
-        while True:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-            new_height = driver.execute_script("return document.body.scrollHeight")
-            if new_height == last_height:
-                break
-            last_height = new_height
-
-        # ----------- COLLECT ALL PROPERTY LINKS -----------
         soup = BeautifulSoup(driver.page_source, "html.parser")
         property_links = soup.select("a[href*='/housing/property/']")
         urls = list({BASE_URL + a["href"] for a in property_links if a.get("href")})
 
         print(f"Found {len(urls)} properties")
 
-        # ----------- SCRAPE EACH PROPERTY -----------
         for i, url in enumerate(urls):
             print(f"[{i+1}/{len(urls)}] {url}")
             driver.get(url)
@@ -117,18 +103,18 @@ def get_uva_listings():
 
                 # ---------------- CONTACT LINK ----------------
                 contact_link_tag = page.find("a", href=re.compile("contact", re.I))
-                landlord_contact_url = contact_link_tag["href"] if contact_link_tag else None
-                if landlord_contact_url and not landlord_contact_url.startswith("http"):
-                    landlord_contact_url = BASE_URL + landlord_contact_url
+                landlord_contact_url = BASE_URL + contact_link_tag["href"] if contact_link_tag else None
 
-                # ---------------- LAT/LONG ----------------
-                api_key = os.getenv("GEOCODE_API_KEY")  
-
+                # ---------------- LAT/LONG (hidden in page scripts sometimes) ----------------
                 latitude = None
                 longitude = None
+                script_text = driver.page_source
 
-                if address:
-                    latitude, longitude = geocode_address(address, api_key)
+                coords = re.search(r'"lat"\s*:\s*([0-9\.-]+).*?"lng"\s*:\s*([0-9\.-]+)', script_text)
+                if coords:
+                    latitude = float(coords.group(1))
+                    longitude = float(coords.group(2))
+
 
                 listings.append({
                     "id": listing_id,
@@ -151,40 +137,6 @@ def get_uva_listings():
 
     print(f"Scraped {len(listings)} listings")
     return listings
-
-
-
-def geocode_address(address: str, api_key: str):
-    """
-    Uses geocode.maps.co to look up latitude and longitude for an address.
-    Returns (latitude, longitude) or (None, None) if not found.
-    """
-    if not address:
-        return None, None
-
-    try:
-        url = "https://geocode.maps.co/search"
-        params = {
-            "q": address,
-            "api_key": api_key
-        }
-
-        response = requests.get(url, params=params, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-
-        if isinstance(data, list) and len(data) > 0:
-            lat = float(data[0].get("lat"))
-            lon = float(data[0].get("lon"))
-            return lat, lon
-
-    except Exception as e:
-        print(f"Geocoding failed for '{address}': {e}")
-
-    return None, None
-
-
-
 
 
         
