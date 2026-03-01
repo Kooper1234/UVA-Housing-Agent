@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { Pool } from "pg";
 
 import { createServiceRoleClient } from "@/lib/supabase";
-import type { Citation } from "@/types/listings";
+import type { Citation, Listing } from "@/types/listings";
 
 type HousingChunk = {
   id: string;
@@ -19,6 +19,14 @@ type RpcChunk = HousingChunk & {
 type ChatRequestBody = {
   message?: string;
   top_k?: number;
+};
+
+type ListingFilters = {
+  maxPricePerPerson: number | null;
+  bedrooms: number | null;
+  minBedrooms: number | null;
+  maxBedrooms: number | null;
+  sortByCheapest: boolean;
 };
 
 const EMBEDDING_MODEL = "openai/text-embedding-3-small";
@@ -210,6 +218,10 @@ async function searchRelevantChunks(
 }
 
 function buildContext(chunks: HousingChunk[]): string {
+  if (!chunks.length) {
+    return "No matching housing chunks were retrieved for this query.";
+  }
+
   return chunks
     .map((chunk, index) => {
       const topicLabel = chunk.topic ? `Topic: ${chunk.topic}` : "Topic: Unknown";
@@ -223,15 +235,171 @@ function buildContext(chunks: HousingChunk[]): string {
 }
 
 function buildCitations(chunks: HousingChunk[]): Citation[] {
-  return chunks.map((chunk) => ({
-    id: chunk.id,
-    topic: chunk.topic,
-    scope: chunk.scope,
-    source_url: chunk.source_url,
-  }));
+  return chunks
+    .filter((chunk) => !(chunk.source_url === null && chunk.topic === null))
+    .map((chunk) => ({
+      id: chunk.id,
+      topic: chunk.topic ?? "Housing source",
+      scope: chunk.scope,
+      source_url: chunk.source_url,
+    }));
 }
 
-async function generateAnswer(question: string, context: string): Promise<string> {
+function extractListingFilters(message: string): ListingFilters {
+  const normalized = message.toLowerCase();
+  const sortByCheapest = /\b(cheap|cheapest|affordable|budget|lowest|least expensive)\b/.test(
+    normalized,
+  );
+
+  const maxPriceMatch = normalized.match(
+    /(?:under|below|less than|at most|max(?:imum)?)\s*\$?\s*(\d{3,5})/,
+  );
+  const dollarAmountMatch = normalized.match(/\$\s*(\d{3,5})/);
+
+  const rangeBedroomsMatch = normalized.match(
+    /(\d+)\s*-\s*(\d+)\s*(?:bed|bedroom|bedrooms|br)\b/,
+  );
+  const minBedroomsMatch = normalized.match(
+    /(?:at least|min(?:imum)?)\s*(\d+)\s*(?:bed|bedroom|bedrooms|br)\b/,
+  );
+  const maxBedroomsMatch = normalized.match(
+    /(?:up to|at most|max(?:imum)?)\s*(\d+)\s*(?:bed|bedroom|bedrooms|br)\b/,
+  );
+  const exactBedroomsMatch = normalized.match(
+    /\b(\d+)\s*(?:bed|bedroom|bedrooms|br)\b/,
+  );
+
+  let minBedrooms: number | null = null;
+  let maxBedrooms: number | null = null;
+  let bedrooms: number | null = null;
+
+  if (rangeBedroomsMatch) {
+    minBedrooms = Number.parseInt(rangeBedroomsMatch[1], 10);
+    maxBedrooms = Number.parseInt(rangeBedroomsMatch[2], 10);
+  } else if (minBedroomsMatch || maxBedroomsMatch) {
+    minBedrooms = minBedroomsMatch ? Number.parseInt(minBedroomsMatch[1], 10) : null;
+    maxBedrooms = maxBedroomsMatch ? Number.parseInt(maxBedroomsMatch[1], 10) : null;
+  } else if (/\bstudio\b/.test(normalized)) {
+    bedrooms = 0;
+  } else if (exactBedroomsMatch) {
+    bedrooms = Number.parseInt(exactBedroomsMatch[1], 10);
+  }
+
+  return {
+    maxPricePerPerson: Number.parseInt(
+      maxPriceMatch?.[1] ?? dollarAmountMatch?.[1] ?? "",
+      10,
+    ) || null,
+    bedrooms,
+    minBedrooms,
+    maxBedrooms,
+    sortByCheapest,
+  };
+}
+
+function listingSortPrice(a: Listing, b: Listing): number {
+  const aPrice = a.price_per_person ?? a.price_total ?? Number.MAX_SAFE_INTEGER;
+  const bPrice = b.price_per_person ?? b.price_total ?? Number.MAX_SAFE_INTEGER;
+
+  if (aPrice === bPrice) {
+    return (a.name || "").localeCompare(b.name || "");
+  }
+
+  return aPrice - bPrice;
+}
+
+async function fetchRelevantListings(message: string): Promise<Listing[]> {
+  const supabase = createServiceRoleClient();
+  const filters = extractListingFilters(message);
+  const { data, error } = await supabase
+    .from("off_grounds_listings")
+    .select(
+      "id,name,address,latitude,longitude,bedrooms,price_total,price_per_person,url,landlord_contact_url",
+    )
+    .limit(300);
+
+  if (error || !data) {
+    throw new Error(`Unable to load listings: ${error?.message ?? "Unknown error"}`);
+  }
+
+  const listings = data as Listing[];
+  const filtered = listings.filter((listing) => {
+    const effectivePrice = listing.price_per_person ?? listing.price_total;
+
+    if (filters.maxPricePerPerson !== null) {
+      if (effectivePrice === null || effectivePrice > filters.maxPricePerPerson) {
+        return false;
+      }
+    }
+
+    if (filters.bedrooms !== null) {
+      return listing.bedrooms === filters.bedrooms;
+    }
+
+    if (filters.minBedrooms !== null) {
+      if (listing.bedrooms === null || listing.bedrooms < filters.minBedrooms) {
+        return false;
+      }
+    }
+
+    if (filters.maxBedrooms !== null) {
+      if (listing.bedrooms === null || listing.bedrooms > filters.maxBedrooms) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+
+  if (filters.maxPricePerPerson !== null || filters.sortByCheapest) {
+    return filtered.sort(listingSortPrice);
+  }
+
+  return filtered.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+}
+
+function formatMoney(value: number | null): string {
+  if (value === null) {
+    return "Unknown";
+  }
+
+  return `$${Math.round(value).toLocaleString()}`;
+}
+
+function buildListingsContext(listings: Listing[]): string {
+  if (!listings.length) {
+    return "No matching off-grounds listings were found.";
+  }
+
+  return listings
+    .slice(0, 12)
+    .map((listing, index) => {
+      const name = listing.name || "Unnamed listing";
+      const address = listing.address || "Address not provided";
+      const bedrooms = listing.bedrooms ?? "Unknown";
+      const perPerson = formatMoney(listing.price_per_person);
+      const total = formatMoney(listing.price_total);
+      const url = listing.url || "No listing URL";
+      const contact = listing.landlord_contact_url || "No contact URL";
+
+      return [
+        `[L${index + 1}] ${name}`,
+        `Address: ${address}`,
+        `Bedrooms: ${bedrooms}`,
+        `Price per person: ${perPerson}`,
+        `Total price: ${total}`,
+        `Listing URL: ${url}`,
+        `Contact URL: ${contact}`,
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+async function generateAnswer(
+  question: string,
+  ragContext: string,
+  listingsContext: string,
+): Promise<string> {
   const response = await fetch(OPENROUTER_CHAT_URL, {
     method: "POST",
     headers: {
@@ -248,7 +416,7 @@ async function generateAnswer(question: string, context: string): Promise<string
         },
         {
           role: "user",
-          content: `Context:\n${context}\n\nQuestion:\n${question}`,
+          content: `Housing knowledge context (RAG chunks):\n${ragContext}\n\nRelevant listing data (off_grounds_listings):\n${listingsContext}\n\nUser question:\n${question}`,
         },
       ],
     }),
@@ -290,17 +458,19 @@ export async function POST(request: Request) {
 
     const queryEmbedding = await getEmbedding(message);
     const chunks = await searchRelevantChunks(queryEmbedding, topK);
+    const listings = await fetchRelevantListings(message);
 
-    if (!chunks.length) {
+    if (!chunks.length && !listings.length) {
       return NextResponse.json({
         answer:
-          "I couldn't find relevant housing context in the database yet. Try asking about pricing, neighborhoods, lease terms, or transportation around UVA.",
+          "I couldn't find relevant housing context or listings in the database yet. Try asking about pricing, neighborhoods, lease terms, or transportation around UVA.",
         citations: [],
       });
     }
 
-    const context = buildContext(chunks);
-    const answer = await generateAnswer(message, context);
+    const ragContext = buildContext(chunks);
+    const listingsContext = buildListingsContext(listings);
+    const answer = await generateAnswer(message, ragContext, listingsContext);
 
     return NextResponse.json({
       answer,
