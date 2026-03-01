@@ -1,21 +1,24 @@
 import type { Metadata } from "next";
-import { Merriweather, Public_Sans } from "next/font/google";
+import { Archivo, Inter } from "next/font/google";
 
 import "./globals.css";
 
-const bodyFont = Public_Sans({
-  variable: "--font-public-sans",
+const bodyFont = Inter({
+  variable: "--font-inter",
   subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
 });
 
-const headingFont = Merriweather({
-  variable: "--font-merriweather",
+const displayFont = Archivo({
+  variable: "--font-archivo",
   subsets: ["latin"],
+  weight: ["600", "700"],
 });
 
 export const metadata: Metadata = {
-  title: "UVA Housing",
-  description: "Search off-grounds housing listings around the University of Virginia.",
+  title: "UVA Housing Agent",
+  description:
+    "Search UVA-area housing by per-person price, class-building commute, and AI-guided recommendations.",
 };
 
 export default function RootLayout({
@@ -25,7 +28,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`${bodyFont.variable} ${headingFont.variable} antialiased`}>
+      <body className={`${bodyFont.variable} ${displayFont.variable}`}>
         {children}
       </body>
     </html>
