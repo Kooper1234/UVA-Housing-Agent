@@ -1,127 +1,121 @@
 # backend/main.py
-from fastapi import FastAPI
+import logging
+import traceback
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
 from db import get_pool
-from housing_tools import search_off_grounds_listings
+from housing_tools import (
+    embed_query_text,
+    vector_search_housing_chunks,
+    search_off_grounds_listings,
+    call_openrouter_chat,
+)
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("uva-housing-agent")
 
 app = FastAPI()
 
 
 class ChatRequest(BaseModel):
-    """
-    Minimal chat request model.
-    For now, the user can optionally pass numeric filters directly; later
-    you'll parse them out of the free-form message using an LLM.
-    """
     message: str
-    max_rent_per_person: int | None = None
-    min_bedrooms: int | None = None
-    max_bedrooms: int | None = None
+    top_k: int = 6
+    include_off_grounds: bool = False
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"ok": True}
 
 
 @app.get("/db-check")
 async def db_check():
-    """
-    Simple connectivity check to Supabase Postgres.
-    Runs a lightweight SELECT 1 query and reports success/failure.
-    """
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT 1 AS ok;")
         return {"db_connected": True, "result": dict(row)}
     except Exception as e:
-        # In a real prod app you wouldn't return the raw error, but for now it's
-        # helpful for debugging your setup.
-        return {"db_connected": False, "error": str(e)}
-
-
-@app.get("/test/off-grounds")
-async def test_off_grounds():
-    """
-    Temporary endpoint to prove we can talk to Supabase.
-    It returns up to 5 rows from off_grounds_listings.
-    """
-    pool = await get_pool()
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, name, price_per_person, bedrooms
-            FROM off_grounds_listings
-            ORDER BY price_per_person ASC
-            LIMIT 5;
-            """
-        )
-
-    # convert asyncpg Records to plain dicts so FastAPI can JSON-serialize them
-    return [dict(row) for row in rows]
-
-
-@app.get("/search/off-grounds")
-async def search_off_grounds(
-    max_rent_per_person: int | None = None,
-    min_bedrooms: int | None = None,
-    max_bedrooms: int | None = None,
-    limit: int = 20,
-):
-    """
-    Public API endpoint that wraps search_off_grounds_listings.
-    Example:
-    /search/off-grounds?max_rent_per_person=900&min_bedrooms=4
-    """
-    listings = await search_off_grounds_listings(
-        max_rent_per_person=max_rent_per_person,
-        min_bedrooms=min_bedrooms,
-        max_bedrooms=max_bedrooms,
-        limit=limit,
-    )
-    return {"results": listings}
+        logger.error("DB check failed: %s", str(e))
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="DB check failed")
 
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
-    """
-    Very simple chat endpoint:
-    - Takes a message and optional numeric filters.
-    - Calls search_off_grounds_listings.
-    - Returns a basic text response plus the raw listings.
+async def chat(req: ChatRequest):
+    try:
+        question = req.message.strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="message cannot be empty")
 
-    Example body:
-    {
-      "message": "Looking for a 3BR or 4BR near Grounds around $900/person",
-      "max_rent_per_person": 900,
-      "min_bedrooms": 3,
-      "max_bedrooms": 4
-    }
-    """
-    listings = await search_off_grounds_listings(
-        max_rent_per_person=request.max_rent_per_person,
-        min_bedrooms=request.min_bedrooms,
-        max_bedrooms=request.max_bedrooms,
-        limit=10,
-    )
+        # 1) Embed question
+        query_embedding = await embed_query_text(question)
 
-    count = len(listings)
-    if count == 0:
-        reply = "I couldn't find any off-grounds listings that match those filters yet. Try adjusting the budget or bedroom count."
-    else:
-        reply = (
-            f"I found {count} off-grounds place(s) that match your filters. "
-            "Here are some options with their prices and bedroom counts."
+        # 2) Retrieve top chunks (RAG)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            chunks = await vector_search_housing_chunks(conn, query_embedding, top_k=req.top_k)
+
+            listings = []
+            if req.include_off_grounds:
+                # this won't crash anymore even if main passes extra filters later
+                listings = await search_off_grounds_listings(conn, question, limit=5)
+
+        # 3) Build citations + context
+        citations = []
+        context_parts = []
+
+        for i, ch in enumerate(chunks, start=1):
+            label = ch["source"] or f"housing_chunks:{ch['id']}"
+            citations.append({
+                "cite": f"[{i}]",
+                "source": label,
+                "url": ch["url"],
+                "chunk_id": ch["id"],
+                "distance": ch["distance"],
+            })
+            context_parts.append(f"[{i}] {ch['content']}")
+
+        listings_text = ""
+        if listings:
+            listings_lines = []
+            for l in listings:
+                listings_lines.append(f"- {l.get('title','(listing)')} | {l.get('location','')} | {l.get('price','')} | {l.get('url','')}")
+            listings_text = "\n\nOff-grounds listings:\n" + "\n".join(listings_lines)
+
+        system_msg = (
+            "You are the UVA Housing Agent. Use the provided context to answer. "
+            "If the context does not contain the answer, say what is missing. "
+            "Cite sources using [1], [2], etc."
         )
 
-    return {
-        "message": reply,
-        "filters_used": {
-            "max_rent_per_person": request.max_rent_per_person,
-            "min_bedrooms": request.min_bedrooms,
-            "max_bedrooms": request.max_bedrooms,
-        },
-        "results": listings,
-    }
+        user_msg = (
+            f"Question:\n{question}\n\n"
+            f"Context:\n" + "\n\n".join(context_parts) +
+            listings_text +
+            "\n\nWrite a helpful answer with citations."
+        )
+
+        # 4) Call OpenRouter
+        answer = await call_openrouter_chat([
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ])
+
+        return {
+            "answer": answer,
+            "citations": citations,
+            "num_chunks": len(chunks),
+            "num_listings": len(listings),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("CHAT failed: %s", str(e))
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Internal Server Error. Check server logs.")
